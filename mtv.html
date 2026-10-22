@@ -1,24 +1,184 @@
 <!DOCTYPE html>
-<html>
+<html lang="es">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MTV Minecraft</title>
+    <!-- Carga de la librería HLS.js compatible con Edge, Chrome y Firefox -->
     <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
     <style>
-        body, html { margin: 0; padding: 0; width: 100%; height: 100%; background: black; overflow: hidden; }
-        video { width: 100%; height: 100%; object-fit: contain; }
+        * {
+            box-sizing: border-box;
+        }
+        body, html { 
+            margin: 0; 
+            padding: 0; 
+            width: 100%; 
+            height: 100%; 
+            background-color: #000000; 
+            overflow: hidden; 
+            font-family: system-ui, -apple-system, sans-serif;
+        }
+        /* Vídeo nativo a pantalla completa exactamente como en la captura */
+        video { 
+            width: 100%; 
+            height: 100%; 
+            object-fit: contain; 
+            outline: none;
+        }
+        /* Indicador sutil de reconexión si la señal de Cloudflare se pierde */
+        #status-overlay {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(0, 0, 0, 0.75);
+            color: #ffffff;
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 500;
+            display: none;
+            align-items: center;
+            gap: 8px;
+            z-index: 10;
+            backdrop-filter: blur(4px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            pointer-events: none;
+        }
+        .dot {
+            width: 8px;
+            height: 8px;
+            background-color: #ff4d4d;
+            border-radius: 50%;
+            animation: pulse 1.2s infinite;
+        }
+        @keyframes pulse {
+            0% { opacity: 0.3; transform: scale(0.8); }
+            50% { opacity: 1; transform: scale(1.2); }
+            100% { opacity: 0.3; transform: scale(0.8); }
+        }
     </style>
 </head>
 <body>
-    <video id="video" autoplay muted controls></video>
+
+    <!-- Overlay de estado de reconexión (discreto en la esquina) -->
+    <div id="status-overlay">
+        <span class="dot"></span>
+        <span id="status-text">Conectando...</span>
+    </div>
+
+    <!-- Reproductor Vídeo HTML5 idéntico al original -->
+    <video id="video" autoplay muted playsinline controls></video>
+
     <script>
-      var video = document.getElementById('video');
-      var videoSrc = 'https://transmitted-shuttle-charging-ant.trycloudflare.com/live/mtv/index.m3u8';
-      if (Hls.isSupported()) {
-        var hls = new Hls();
-        hls.loadSource(videoSrc);
-        hls.attachTo(video);
-      }
+      (function() {
+        var video = document.getElementById('video');
+        var statusOverlay = document.getElementById('status-overlay');
+        var statusText = document.getElementById('status-text');
+
+        // Permite cambiar la URL agregando ?url=TU_URL.m3u8 en la barra del navegador o usa esta por defecto
+        var urlParams = new URLSearchParams(window.location.search);
+        var videoSrc = urlParams.get('url') || 'https://transmitted-shuttle-charging-ant.trycloudflare.com/live/mtv/index.m3u8';
+
+        var hls = null;
+        var retryInterval = null;
+
+        function showStatus(text) {
+            statusText.innerText = text;
+            statusOverlay.style.display = 'flex';
+        }
+
+        function hideStatus() {
+            statusOverlay.style.display = 'none';
+        }
+
+        function playVideo() {
+            var playPromise = video.play();
+            if (playPromise !== undefined) {
+                playPromise.then(function() {
+                    hideStatus();
+                }).catch(function(error) {
+                    console.log("Autoplay con audio silenciado para evitar bloqueo del navegador.");
+                    video.muted = true;
+                    video.play();
+                });
+            }
+        }
+
+        function initHls() {
+            if (hls) {
+                hls.destroy();
+            }
+
+            if (Hls.isSupported()) {
+                hls = new Hls({
+                    debug: false,
+                    enableWorker: true,
+                    lowLatencyMode: true,
+                    manifestLoadingTimeOut: 10000,
+                    manifestLoadingMaxRetry: 5,
+                    levelLoadingTimeOut: 10000,
+                    fragLoadingTimeOut: 10000
+                });
+
+                hls.loadSource(videoSrc);
+                hls.attachMedia(video);
+
+                hls.on(Hls.Events.MANIFEST_PARSED, function() {
+                    playVideo();
+                });
+
+                // Control de errores de red (típicos al reiniciar OBS / Cloudflared / MediaMTX)
+                hls.on(Hls.Events.ERROR, function(event, data) {
+                    if (data.fatal) {
+                        switch (data.type) {
+                            case Hls.ErrorTypes.NETWORK_ERROR:
+                                showStatus('Reconectando con la emisión...');
+                                console.warn('Error de red detectado, reintentando conexión...');
+                                scheduleReconnect();
+                                break;
+                            case Hls.ErrorTypes.MEDIA_ERROR:
+                                console.warn('Error de códec/medio, intentando recuperar...');
+                                hls.recoverMediaError();
+                                break;
+                            default:
+                                showStatus('Error en la emisión. Reintentando...');
+                                scheduleReconnect();
+                                break;
+                        }
+                    }
+                });
+
+            } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                // Soporte nativo para Safari iOS/macOS
+                video.src = videoSrc;
+                video.addEventListener('loadedmetadata', function() {
+                    playVideo();
+                });
+            }
+        }
+
+        function scheduleReconnect() {
+            if (!retryInterval) {
+                retryInterval = setInterval(function() {
+                    console.log('Intentando reconectar con la señal HLS...');
+                    initHls();
+                }, 5000);
+            }
+        }
+
+        // Limpiar intervalo cuando se conecte con éxito
+        video.addEventListener('playing', function() {
+            if (retryInterval) {
+                clearInterval(retryInterval);
+                retryInterval = null;
+            }
+            hideStatus();
+        });
+
+        // Iniciar reproducción
+        initHls();
+      })();
     </script>
 </body>
 </html>
